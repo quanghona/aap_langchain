@@ -2,7 +2,12 @@ from collections.abc import Callable, Sequence
 from typing import Any, Dict, List, Tuple
 from aap_core import utils
 from aap_core.chain import BaseCausalMultiTurnsChain
-from aap_core.types import AgentMessage, ContentType, TokenUsage
+from aap_core.types import (
+    GATED_MODALITIES,
+    AgentMessage,
+    ContentType,
+    TokenUsage,
+)
 from aap_core.utils import extract_repo_id, huggingface_capabilities
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -20,9 +25,6 @@ from aap_langchain.utils import (
     profile_to_capabilities,
     token_from_response,
 )
-
-# Modalities the media gate can consult; detection reports on these.
-_GATED_MODALITIES: Tuple[ContentType, ...] = ("image", "audio", "video", "document")
 
 
 class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage]):
@@ -79,7 +81,7 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage
     def _resolve_capabilities(self) -> Dict[ContentType, bool]:
         """Query the metadata sources once, filling gaps from the next source."""
         capabilities = profile_to_capabilities(getattr(self._model, "profile", None))
-        if set(capabilities) != set(_GATED_MODALITIES):
+        if set(capabilities) != set(GATED_MODALITIES):
             repo_id = extract_repo_id(self._identifier_candidates())
             if repo_id is not None:
                 for modality, value in huggingface_capabilities(repo_id).items():
