@@ -35,9 +35,26 @@ def media_ref_to_content_block(ref: MediaReference) -> Dict[str, Any]:
     """
     Convert a resolved MediaRef to a langchain content block.
 
-    The mapping is modality-agnostic for image and audio, whose base64/url
-    block shapes are identical in langchain-core 1.x. Document and video
-    blocks use different fields and will need a branch when wired up.
+    Image and audio share one mapping because their block shapes are identical in
+    langchain-core 1.x: AudioContentBlock and ImageContentBlock both carry
+    type/base64/mime_type/url. Document and video blocks use different fields
+    ("file" with a filename, no video block type at all) and will need a branch
+    when wired up.
+
+    Two asymmetries between image and audio live below this function, in the
+    provider adapters, and cannot be fixed at the block level:
+
+    - Transport: an audio ref with kind="url" is representable here, and
+      langchain-core's OpenAI translator rejects it outright
+      ("Key base64 is required for audio blocks"), while an image URL passes
+      through. Adapters differ, so the block stays canonical and callers who must
+      work across providers pass a local path or a data: URI, which resolve_media
+      delivers as base64.
+    - Format token: the same translator derives OpenAI's input_audio.format from
+      the MIME subtype (audio/mpeg becomes "mpeg", which OpenAI rejects; it
+      accepts only "wav" and "mp3"). Rewriting mime_type to satisfy one provider
+      would break the adapters that read it as a MIME string, so the string is
+      passed through unchanged and the mismatch surfaces at the API.
 
     Args:
         ref (MediaRef): The resolved media reference from BaseLLMChain._media_parts.
@@ -78,7 +95,49 @@ def profile_to_capabilities(profile: Any) -> Dict[ContentType, bool]:
     return capabilities
 
 
+def _ollama_carries_audio() -> bool:
+    """Report whether the Ollama chat request schema can carry an audio part.
+
+    This is a fact about the wire format, not about a model family: the message
+    type has one field per media kind, so if no audio field exists, no Ollama
+    model can receive audio regardless of what its model card claims. Read from
+    the installed schema rather than hardcoded, so the answer updates when the
+    transport gains one. An unreadable schema reports True, which leaves the
+    modality undecidable and keeps auto mode fail-loud.
+    """
+    try:
+        from ollama._types import Message
+
+        fields = set(Message.model_fields)
+    except Exception:  # noqa: BLE001 - optional dependency, private module path
+        return True
+    return any("audio" in field.lower() for field in fields)
+
+
+def adapter_capabilities(model: Any) -> Dict[ContentType, bool]:
+    """Map an adapter's transport onto the modalities it can physically deliver.
+
+    Complements profile_to_capabilities: a model profile states what a model
+    understands, this states what the request format can carry, and the second is
+    a hard ceiling on the first. Only denials are returned - a transport that
+    names an audio field proves nothing about a given model accepting it.
+
+    Args:
+        model: A BaseChatModel instance.
+
+    Returns:
+        Dict[ContentType, bool]: Modalities the transport cannot deliver, as False.
+    """
+    for klass in type(model).__mro__:
+        if klass.__module__.split(".")[0] == "langchain_ollama":
+            if not _ollama_carries_audio():
+                return {"audio": False}
+            return {}
+    return {}
+
+
 __all__ = [
+    "adapter_capabilities",
     "media_ref_to_content_block",
     "profile_to_capabilities",
     "token_from_response",

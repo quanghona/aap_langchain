@@ -24,16 +24,24 @@ from aap_core.utils import (
 )
 from aap_langchain.chain import ChatCausalMultiTurnsChain
 from aap_langchain.utils import (
+    _ollama_carries_audio,
+    adapter_capabilities,
     media_ref_to_content_block,
     profile_to_capabilities,
 )
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# The RIFF form type sits at offset 8, so a valid WAV needs the 12-byte prefix.
+WAV_MAGIC = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE"
+# An ID3v2 tag with a zero-length body; the MPEG frame sync follows it.
+MP3_MAGIC = b"ID3\x04\x00\x00" + b"\x00" * 4 + b"\xff\xfb\x90\x00"
 
 # Capability evidence now comes from metadata, so tests declare it explicitly
 # instead of relying on model names.
 VISION_PROFILE: Dict[str, bool] = {"image_inputs": True}
 TEXT_ONLY_PROFILE: Dict[str, bool] = {"image_inputs": False}
+AUDIO_PROFILE: Dict[str, bool] = {"audio_inputs": True}
+MULTIMODAL_PROFILE: Dict[str, bool] = {"image_inputs": True, "audio_inputs": True}
 
 
 class FakeChatModel(BaseChatModel):
@@ -191,6 +199,100 @@ class TestPrepareConversationWithImages:
         conversation = chain._prepare_conversation(msg)
         assert isinstance(user_message_of(conversation).content, list)
         assert conversation[2].content == "old text turn"  # history stays text
+
+
+class TestPrepareConversationWithAudio:
+    """Audio media must reach the model as audio, never as a transcript."""
+
+    def test_url_audio_becomes_content_part(self):
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(
+            query="what song?",
+            query_media=[("audio", "https://example.com/clip.wav")],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == [
+            {"type": "text", "text": "what song?"},
+            {"type": "audio", "url": "https://example.com/clip.wav"},
+        ]
+
+    def test_local_path_audio_becomes_base64_part(self, tmp_path):
+        f = tmp_path / "clip.wav"
+        f.write_bytes(WAV_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(query="listen", query_media=[("audio", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[0] == {"type": "text", "text": "listen"}
+        assert content[1]["type"] == "audio"
+        assert content[1]["mime_type"] == "audio/wav"
+        assert base64.b64decode(content[1]["base64"]) == f.read_bytes()
+
+    def test_audio_format_is_sniffed_not_taken_from_the_extension(self, tmp_path):
+        """A mislabelled .txt carrying WAV bytes must still deliver audio/wav."""
+        f = tmp_path / "clip.txt"
+        f.write_bytes(WAV_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(query="listen", query_media=[("audio", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[1]["mime_type"] == "audio/wav"
+
+    def test_mp3_tag_is_reported_as_audio_mpeg(self, tmp_path):
+        """The MIME string is what an adapter derives its format token from."""
+        f = tmp_path / "clip.mp3"
+        f.write_bytes(MP3_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(query="listen", query_media=[("audio", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[1]["mime_type"] == "audio/mpeg"
+
+    def test_multiple_audio_preserve_order(self):
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(
+            query="two clips",
+            query_media=[
+                ("audio", "https://example.com/a.mp3"),
+                ("audio", "https://example.com/b.wav"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block.get("url", "") for block in content[1:]] == [
+            "https://example.com/a.mp3",
+            "https://example.com/b.wav",
+        ]
+
+    def test_images_and_audio_both_attach(self):
+        """One message carrying two modalities must lose neither."""
+        chain = make_chain(profile=MULTIMODAL_PROFILE)
+        msg = AgentMessage(
+            query="compare",
+            query_media=[
+                ("audio", "https://example.com/a.wav"),
+                ("image", "https://example.com/b.png"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block["type"] for block in content] == ["text", "image", "audio"]
+
+    def test_no_repr_leak_into_text_part(self):
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(
+            query="what?", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[0]["text"] == "what?"
+        assert "example.com" not in content[0]["text"]
+
+    def test_audio_attaches_only_to_current_user_message(self):
+        chain = make_chain(profile=AUDIO_PROFILE)
+        chain.include_history = 1
+        msg = AgentMessage(
+            query="new",
+            query_media=[("audio", "https://example.com/a.wav")],
+            responses=[("user", "old text turn")],
+        )
+        conversation = chain._prepare_conversation(msg)
+        assert isinstance(user_message_of(conversation).content, list)
+        assert conversation[2].content == "old text turn"
 
 
 class TestCapabilityDetection:
@@ -470,3 +572,195 @@ class TestMediaRefToContentBlock:
             }
         )
         assert block["type"] == "audio"
+
+    def test_audio_url_ref(self):
+        """URL refs stay canonical here; whether an adapter takes them is below."""
+        block = media_ref_to_content_block(
+            {
+                "content_type": "audio",
+                "kind": "url",
+                "value": "https://x/a.wav",
+                "mime_type": "audio/wav",
+            }
+        )
+        assert block == {"type": "audio", "url": "https://x/a.wav"}
+
+
+class TestGatePerModality:
+    """The gate is per modality: audio support says nothing about image support."""
+
+    def test_audio_denied_by_profile_drops_with_warning(self, caplog):
+        chain = make_chain(profile={"audio_inputs": False})
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "listen"
+        assert "does not support audio input" in caplog.text
+
+    def test_disabled_policy_is_not_applied_to_other_modalities(self):
+        chain = make_chain(
+            profile=None,
+            media_support={"image": "enabled", "audio": "disabled"},
+        )
+        msg = AgentMessage(
+            query="both",
+            query_media=[
+                ("image", "https://example.com/a.png"),
+                ("audio", "https://example.com/b.wav"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block["type"] for block in content] == ["text", "image"]
+
+    def test_enabled_policy_forces_audio_parts_on_unknown_model(self):
+        chain = make_chain(
+            model_name="some-brand-new-model",
+            profile=None,
+            media_support={"audio": "enabled"},
+        )
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "audio"
+
+    def test_undecidable_audio_attaches_fail_loud(self):
+        chain = make_chain(model_name="some-brand-new-model", profile=None)
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list)
+
+    def test_missing_local_audio_raises(self, tmp_path):
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", str(tmp_path / "nope.wav"))]
+        )
+        with pytest.raises(FileNotFoundError):
+            chain._prepare_conversation(msg)
+
+
+def make_ollama_chain(
+    model_name: str = "llama3.2", **kwargs
+) -> ChatCausalMultiTurnsChain:
+    """Chain over the real Ollama adapter; constructed offline, never invoked."""
+    langchain_ollama = pytest.importorskip("langchain_ollama")
+    return ChatCausalMultiTurnsChain(
+        model=langchain_ollama.ChatOllama(model=model_name),
+        system_prompt="You are helpful.",
+        user_prompt_template="{query}",
+        **kwargs,
+    )
+
+
+class TestTransportCeiling:
+    """A request format with no field for a modality cannot deliver it to any model.
+
+    This is structural evidence, not a model-name heuristic: the Ollama chat
+    message type carries role/content/thinking/images/tool_name/tool_calls and no
+    audio, so langchain_ollama raises "Blocks of type audio not supported." on the
+    way out. Denying the modality turns that crash into the documented
+    degrade-to-text behaviour, which is what auto mode is for.
+    """
+
+    def test_ollama_denies_audio_without_any_metadata_source(self):
+        assert make_ollama_chain().detect_capabilities().get("audio") is False
+
+    def test_ollama_audio_media_degrades_to_text(self, caplog):
+        chain = make_ollama_chain()
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "listen"
+        assert "does not support audio input" in caplog.text
+
+    def test_ollama_ceiling_is_per_modality(self):
+        """Denying audio must not deny images, which the transport does carry."""
+        chain = make_ollama_chain()
+        msg = AgentMessage(
+            query="look", query_media=[("image", "https://example.com/a.png")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "image"
+
+    def test_transport_ceiling_overrides_a_model_card_affirmation(self, hf):
+        """The wire format is a hard limit, so it wins over a positive card tag."""
+        hf.results["google/gemma-3n-e4b-it"] = task_tags_to_capabilities(
+            ["image-text-to-text", "audio-text-to-text"]
+        )
+        chain = make_ollama_chain(model_name="google/gemma-3n-e4b-it")
+        capabilities = chain.detect_capabilities()
+        assert capabilities["audio"] is False
+        assert capabilities["image"] is True
+
+    def test_other_adapters_get_no_opinion(self):
+        assert adapter_capabilities(FakeChatModel()) == {}
+
+    def test_explicit_enable_overrides_the_ceiling(self):
+        """An enabled policy outranks detection, so the adapter error must surface."""
+        chain = make_ollama_chain(media_support={"audio": "enabled"})
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "audio"
+
+    def test_ollama_transport_still_has_no_audio_field(self):
+        """Canary: if this fails, Ollama gained audio and this ceiling must go."""
+        assert _ollama_carries_audio() is False
+
+
+class TestOpenAIBlockContract:
+    """Our blocks checked against the translator a provider adapter actually calls.
+
+    Testing the dict shape alone would only prove we agree with ourselves. This
+    pins the mapping to langchain-core's consumer, and records which of its
+    transports accept audio. The module is internal to langchain-core; if it moves,
+    this test fails and the contract needs re-reading, which is the point.
+    """
+
+    @staticmethod
+    def _translate(block: Dict[str, Any]) -> Any:
+        from langchain_core.messages.block_translators.openai import (
+            convert_to_openai_data_block,
+        )
+
+        return convert_to_openai_data_block(block, api="chat/completions")
+
+    def test_base64_audio_reaches_openai_as_input_audio(self, tmp_path):
+        f = tmp_path / "clip.wav"
+        f.write_bytes(WAV_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(query="listen", query_media=[("audio", str(f))])
+        block = user_message_of(chain._prepare_conversation(msg)).content[1]
+        assert self._translate(block) == {
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64.b64encode(f.read_bytes()).decode(),
+                "format": "wav",
+            },
+        }
+
+    def test_url_audio_is_rejected_by_the_openai_translator(self):
+        """Documented limitation: audio URLs are not portable across adapters."""
+        chain = make_chain(profile=AUDIO_PROFILE)
+        msg = AgentMessage(
+            query="listen", query_media=[("audio", "https://example.com/a.wav")]
+        )
+        block = user_message_of(chain._prepare_conversation(msg)).content[1]
+        with pytest.raises(ValueError, match="base64 is required"):
+            self._translate(block)
+
+    def test_audio_format_token_comes_from_the_mime_subtype(self):
+        """audio/mpeg becomes "mpeg", which OpenAI's wav|mp3 enum rejects."""
+        assert (
+            self._translate(
+                {"type": "audio", "base64": "AAAA", "mime_type": "audio/mpeg"}
+            )["input_audio"]["format"]
+            == "mpeg"
+        )

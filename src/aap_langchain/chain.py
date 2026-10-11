@@ -21,6 +21,7 @@ from langchain_core.tools import BaseTool
 from pydantic import PrivateAttr
 
 from aap_langchain.utils import (
+    adapter_capabilities,
     media_ref_to_content_block,
     profile_to_capabilities,
     token_from_response,
@@ -64,6 +65,10 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage
            provider ships for the exact model revision.
         3. Hugging Face model-card metadata, for models identified by repo id
            (needs the "hf" extra).
+        4. A ceiling from the adapter's request format itself (see
+           adapter_capabilities), applied last: a transport with no field for a
+           modality cannot deliver it to any model, so it denies what the sources
+           above may have affirmed.
 
         Model-family names carry no weight here: variants of one family differ
         per modality (an audio-capable small model and a larger sibling without
@@ -86,6 +91,9 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage
             if repo_id is not None:
                 for modality, value in huggingface_capabilities(repo_id).items():
                     capabilities.setdefault(modality, value)
+        for modality, carried in adapter_capabilities(self._model).items():
+            if not carried:
+                capabilities[modality] = False
         return capabilities
 
     def _identifier_candidates(self) -> List[str]:
@@ -111,12 +119,19 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage
 
     def _prepare_conversation(self, message: AgentMessage) -> List[BaseMessage]:
         user_prompt = self._user_prompt_template.format(**message.format_kwargs())
-        images = self._image_parts(message)
+        # One funnel call per modality, because the gate (_modality_ok) is
+        # per-modality and a model may accept images but reject audio. The cost is
+        # that parts arrive grouped by modality rather than in query_media order;
+        # MediaReference carries no source index, so interleaving would need a
+        # core-side change. Video and document are deliberately absent: langchain
+        # has no video block type and its file block needs a filename, so mapping
+        # those modalities is more than this function can do generically.
+        parts = [*self._image_parts(message), *self._audio_parts(message)]
         user_content: str | List[Any] = user_prompt
-        if images:
+        if parts:
             user_content = [
                 {"type": "text", "text": user_prompt},
-                *[media_ref_to_content_block(ref) for ref in images],
+                *[media_ref_to_content_block(ref) for ref in parts],
             ]
         conversation = [
             SystemMessage(self._system_prompt),
