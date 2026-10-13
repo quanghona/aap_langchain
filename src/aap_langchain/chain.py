@@ -123,10 +123,17 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[BaseMessage, AIMessage
         # per-modality and a model may accept images but reject audio. The cost is
         # that parts arrive grouped by modality rather than in query_media order;
         # MediaReference carries no source index, so interleaving would need a
-        # core-side change. Video and document are deliberately absent: langchain
-        # has no video block type and its file block needs a filename, so mapping
-        # those modalities is more than this function can do generically.
-        parts = [*self._image_parts(message), *self._audio_parts(message)]
+        # core-side change. Video joins the funnel on the strength of
+        # langchain-core's VideoContentBlock, which shares the image/audio block
+        # shape; transports that cannot carry it (Ollama's schema, OpenAI's
+        # translator) are denied by adapter_capabilities before this runs, so a
+        # video part reaching here has a delivery path. Document stays unmapped:
+        # its file block needs a filename MediaReference does not carry.
+        parts = [
+            *self._image_parts(message),
+            *self._audio_parts(message),
+            *self._video_parts(message),
+        ]
         user_content: str | List[Any] = user_prompt
         if parts:
             user_content = [

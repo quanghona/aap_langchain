@@ -24,7 +24,8 @@ from aap_core.utils import (
 )
 from aap_langchain.chain import ChatCausalMultiTurnsChain
 from aap_langchain.utils import (
-    _ollama_carries_audio,
+    _ollama_carries,
+    _openai_translator_carries,
     adapter_capabilities,
     media_ref_to_content_block,
     profile_to_capabilities,
@@ -35,13 +36,23 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 WAV_MAGIC = b"RIFF" + (36).to_bytes(4, "little") + b"WAVE"
 # An ID3v2 tag with a zero-length body; the MPEG frame sync follows it.
 MP3_MAGIC = b"ID3\x04\x00\x00" + b"\x00" * 4 + b"\xff\xfb\x90\x00"
+# ISO base media: box size at 0, "ftyp" at 4, major brand at 8. The brand is
+# what separates MP4 from QuickTime, so both fixtures differ only there.
+MP4_MAGIC = b"\x00\x00\x00\x18" + b"ftyp" + b"isom" + b"\x00" * 4
+QT_MAGIC = b"\x00\x00\x00\x18" + b"ftyp" + b"qt  " + b"\x00" * 4
 
 # Capability evidence now comes from metadata, so tests declare it explicitly
 # instead of relying on model names.
 VISION_PROFILE: Dict[str, bool] = {"image_inputs": True}
 TEXT_ONLY_PROFILE: Dict[str, bool] = {"image_inputs": False}
 AUDIO_PROFILE: Dict[str, bool] = {"audio_inputs": True}
+VIDEO_PROFILE: Dict[str, bool] = {"video_inputs": True}
 MULTIMODAL_PROFILE: Dict[str, bool] = {"image_inputs": True, "audio_inputs": True}
+TRIMODAL_PROFILE: Dict[str, bool] = {
+    "image_inputs": True,
+    "audio_inputs": True,
+    "video_inputs": True,
+}
 
 
 class FakeChatModel(BaseChatModel):
@@ -288,6 +299,111 @@ class TestPrepareConversationWithAudio:
         msg = AgentMessage(
             query="new",
             query_media=[("audio", "https://example.com/a.wav")],
+            responses=[("user", "old text turn")],
+        )
+        conversation = chain._prepare_conversation(msg)
+        assert isinstance(user_message_of(conversation).content, list)
+        assert conversation[2].content == "old text turn"
+
+
+class TestPrepareConversationWithVideo:
+    """Video media must reach the model as one container part, never as frames.
+
+    Frame sampling is the provider's decision (Gemini samples at 1 FPS, other
+    APIs expose their own knobs); decomposing a video into N image parts here
+    would change what the model was told it received.
+    """
+
+    def test_url_video_becomes_content_part(self):
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(
+            query="what happens?",
+            query_media=[("video", "https://example.com/clip.mp4")],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == [
+            {"type": "text", "text": "what happens?"},
+            {"type": "video", "url": "https://example.com/clip.mp4"},
+        ]
+
+    def test_local_path_video_becomes_base64_part(self, tmp_path):
+        f = tmp_path / "clip.mp4"
+        f.write_bytes(MP4_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(query="watch", query_media=[("video", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[0] == {"type": "text", "text": "watch"}
+        assert content[1]["type"] == "video"
+        assert content[1]["mime_type"] == "video/mp4"
+        assert base64.b64decode(content[1]["base64"]) == f.read_bytes()
+
+    def test_video_format_is_sniffed_not_taken_from_the_extension(self, tmp_path):
+        """A mislabelled .txt carrying MP4 bytes must still deliver video/mp4."""
+        f = tmp_path / "clip.txt"
+        f.write_bytes(MP4_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(query="watch", query_media=[("video", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[1]["mime_type"] == "video/mp4"
+
+    def test_quicktime_brand_beats_the_mp4_extension(self, tmp_path):
+        """Shipping a .mov as video/mp4 puts the wrong container in front of a provider."""
+        f = tmp_path / "clip.mp4"
+        f.write_bytes(QT_MAGIC + b"\x00" * 16)
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(query="watch", query_media=[("video", str(f))])
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[1]["mime_type"] == "video/quicktime"
+
+    def test_multiple_videos_preserve_order(self):
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(
+            query="two clips",
+            query_media=[
+                ("video", "https://example.com/a.mp4"),
+                ("video", "https://example.com/b.mov"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block.get("url", "") for block in content[1:]] == [
+            "https://example.com/a.mp4",
+            "https://example.com/b.mov",
+        ]
+
+    def test_images_audio_and_video_all_attach(self):
+        """One message carrying three modalities must lose none."""
+        chain = make_chain(profile=TRIMODAL_PROFILE)
+        msg = AgentMessage(
+            query="compare",
+            query_media=[
+                ("video", "https://example.com/c.mp4"),
+                ("audio", "https://example.com/a.wav"),
+                ("image", "https://example.com/b.png"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block["type"] for block in content] == [
+            "text",
+            "image",
+            "audio",
+            "video",
+        ]
+
+    def test_no_repr_leak_into_text_part(self):
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(
+            query="what?", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content[0]["text"] == "what?"
+        assert "example.com" not in content[0]["text"]
+
+    def test_video_attaches_only_to_current_user_message(self):
+        chain = make_chain(profile=VIDEO_PROFILE)
+        chain.include_history = 1
+        msg = AgentMessage(
+            query="new",
+            query_media=[("video", "https://example.com/a.mp4")],
             responses=[("user", "old text turn")],
         )
         conversation = chain._prepare_conversation(msg)
@@ -585,6 +701,33 @@ class TestMediaRefToContentBlock:
         )
         assert block == {"type": "audio", "url": "https://x/a.wav"}
 
+    def test_video_ref_same_shape(self):
+        """Video blocks share the base64 shape; mapping is modality-generic."""
+        block = media_ref_to_content_block(
+            {
+                "content_type": "video",
+                "kind": "base64",
+                "value": "AAAA",
+                "mime_type": "video/mp4",
+            }
+        )
+        assert block == {
+            "type": "video",
+            "base64": "AAAA",
+            "mime_type": "video/mp4",
+        }
+
+    def test_video_url_ref(self):
+        block = media_ref_to_content_block(
+            {
+                "content_type": "video",
+                "kind": "url",
+                "value": "https://x/a.mp4",
+                "mime_type": "video/mp4",
+            }
+        )
+        assert block == {"type": "video", "url": "https://x/a.mp4"}
+
 
 class TestGatePerModality:
     """The gate is per modality: audio support says nothing about image support."""
@@ -642,6 +785,59 @@ class TestGatePerModality:
         with pytest.raises(FileNotFoundError):
             chain._prepare_conversation(msg)
 
+    def test_video_denied_by_profile_drops_with_warning(self, caplog):
+        chain = make_chain(profile={"video_inputs": False})
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "watch"
+        assert "does not support video input" in caplog.text
+
+    def test_disabled_video_policy_is_not_applied_to_other_modalities(self):
+        chain = make_chain(
+            profile=None,
+            media_support={"image": "enabled", "video": "disabled"},
+        )
+        msg = AgentMessage(
+            query="both",
+            query_media=[
+                ("image", "https://example.com/a.png"),
+                ("video", "https://example.com/b.mp4"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block["type"] for block in content] == ["text", "image"]
+
+    def test_enabled_policy_forces_video_parts_on_unknown_model(self):
+        chain = make_chain(
+            model_name="some-brand-new-model",
+            profile=None,
+            media_support={"video": "enabled"},
+        )
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "video"
+
+    def test_undecidable_video_attaches_fail_loud(self):
+        chain = make_chain(model_name="some-brand-new-model", profile=None)
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list)
+
+    def test_missing_local_video_raises(self, tmp_path):
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(
+            query="watch", query_media=[("video", str(tmp_path / "nope.mp4"))]
+        )
+        with pytest.raises(FileNotFoundError):
+            chain._prepare_conversation(msg)
+
 
 def make_ollama_chain(
     model_name: str = "llama3.2", **kwargs
@@ -656,13 +852,27 @@ def make_ollama_chain(
     )
 
 
+class FakeOpenAIChatModel(FakeChatModel):
+    """Stand-in for the langchain_openai module prefix; the package is not installed.
+
+    adapter_capabilities dispatches on module root, so overriding __module__
+    exercises that branch without an API key. The ceiling itself reads
+    langchain_core's translator, which is installed.
+    """
+
+
+FakeOpenAIChatModel.__module__ = "langchain_openai.chat_models"
+
+
 class TestTransportCeiling:
     """A request format with no field for a modality cannot deliver it to any model.
 
-    This is structural evidence, not a model-name heuristic: the Ollama chat
+    This is structural evidence, not a model-name heuristic. The Ollama chat
     message type carries role/content/thinking/images/tool_name/tool_calls and no
-    audio, so langchain_ollama raises "Blocks of type audio not supported." on the
-    way out. Denying the modality turns that crash into the documented
+    audio or video, so langchain_ollama silently drops a video block on the
+    AIMessage path and raises "Blocks of type video not supported." on the other;
+    langchain_openai's translator raises on every video block, on either API.
+    Denying the modality turns a silent drop or a crash into the documented
     degrade-to-text behaviour, which is what auto mode is for.
     """
 
@@ -710,9 +920,73 @@ class TestTransportCeiling:
         content = user_message_of(chain._prepare_conversation(msg)).content
         assert isinstance(content, list) and content[1]["type"] == "audio"
 
-    def test_ollama_transport_still_has_no_audio_field(self):
-        """Canary: if this fails, Ollama gained audio and this ceiling must go."""
-        assert _ollama_carries_audio() is False
+    def test_ollama_transport_still_has_no_audio_or_video_field(self):
+        """Canary: if this fails, Ollama gained a field and that ceiling must go."""
+        assert _ollama_carries("audio") is False
+        assert _ollama_carries("video") is False
+        assert _ollama_carries("image") is True  # images field exists
+
+    def test_ollama_denies_video_without_any_metadata_source(self):
+        assert make_ollama_chain().detect_capabilities().get("video") is False
+
+    def test_ollama_video_media_degrades_to_text(self, caplog):
+        chain = make_ollama_chain()
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "watch"
+        assert "does not support video input" in caplog.text
+
+    def test_ollama_video_denial_leaves_images_attached(self):
+        """One denial must not become a blanket: images the transport does carry."""
+        chain = make_ollama_chain()
+        msg = AgentMessage(
+            query="look and watch",
+            query_media=[
+                ("image", "https://example.com/a.png"),
+                ("video", "https://example.com/b.mp4"),
+            ],
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert [block["type"] for block in content] == ["text", "image"]
+
+    def test_explicit_enable_overrides_the_video_ceiling(self):
+        chain = make_ollama_chain(media_support={"video": "enabled"})
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "video"
+
+    def test_openai_family_denies_video_by_translator_probe(self):
+        """The denial follows the module prefix, so Azure inherits it too."""
+        assert adapter_capabilities(FakeOpenAIChatModel()) == {"video": False}
+
+    def test_openai_family_video_media_degrades_to_text(self, caplog):
+        chain = ChatCausalMultiTurnsChain(
+            model=FakeOpenAIChatModel(),
+            system_prompt="You are helpful.",
+            user_prompt_template="{query}",
+        )
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "watch"
+        assert "does not support video input" in caplog.text
+
+    def test_openai_translator_still_rejects_video(self):
+        """Canary: if this fails, the translator gained video and the denial lifts.
+
+        Image and audio assertions keep the probe honest in the other direction:
+        a probe that denied everything would pass the video check alone.
+        """
+        assert _openai_translator_carries("video") is False
+        assert _openai_translator_carries("image") is True
+        assert _openai_translator_carries("audio") is True
 
 
 class TestOpenAIBlockContract:
@@ -725,12 +999,12 @@ class TestOpenAIBlockContract:
     """
 
     @staticmethod
-    def _translate(block: Dict[str, Any]) -> Any:
+    def _translate(block: Dict[str, Any], api: str = "chat/completions") -> Any:
         from langchain_core.messages.block_translators.openai import (
             convert_to_openai_data_block,
         )
 
-        return convert_to_openai_data_block(block, api="chat/completions")
+        return convert_to_openai_data_block(block, api=api)
 
     def test_base64_audio_reaches_openai_as_input_audio(self, tmp_path):
         f = tmp_path / "clip.wav"
@@ -764,3 +1038,22 @@ class TestOpenAIBlockContract:
             )["input_audio"]["format"]
             == "mpeg"
         )
+
+    def test_video_blocks_are_rejected_on_either_api(self):
+        """Why the OpenAI-family ceiling exists: no video field on either wire."""
+        for api in ("chat/completions", "responses"):
+            with pytest.raises(ValueError, match="not supported"):
+                self._translate(
+                    {"type": "video", "base64": "AAAA", "mime_type": "video/mp4"},
+                    api=api,
+                )
+
+    def test_our_video_block_is_rejected_by_the_openai_translator(self):
+        """The block the funnel builds, fed to the translator as the adapter would."""
+        chain = make_chain(profile=VIDEO_PROFILE)
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        block = user_message_of(chain._prepare_conversation(msg)).content[1]
+        with pytest.raises(ValueError, match="not supported"):
+            self._translate(block)

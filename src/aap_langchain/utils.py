@@ -3,6 +3,13 @@ from typing import Any, Dict
 from aap_core.types import ContentType, MediaReference, TokenUsage
 from langchain_core.messages.ai import UsageMetadata
 
+# Modalities the transport ceilings in adapter_capabilities can form an opinion
+# on. Document is excluded on purpose: its file block needs a filename
+# MediaReference does not carry, so a probe would confuse a shape mismatch with a
+# transport refusal. This is the gated set minus document, spelled out because the
+# exclusion is a judgement, not a derivation.
+_CEILING_MODALITIES = ("image", "audio", "video")
+
 # ModelProfile input-modality keys, mapped onto the unified ContentType.
 # A profile is a total=False TypedDict, so any key may be absent; absent keys
 # stay undecidable rather than being reported as unsupported.
@@ -35,13 +42,14 @@ def media_ref_to_content_block(ref: MediaReference) -> Dict[str, Any]:
     """
     Convert a resolved MediaRef to a langchain content block.
 
-    Image and audio share one mapping because their block shapes are identical in
-    langchain-core 1.x: AudioContentBlock and ImageContentBlock both carry
-    type/base64/mime_type/url. Document and video blocks use different fields
-    ("file" with a filename, no video block type at all) and will need a branch
-    when wired up.
+    Image, audio and video share one mapping because their block shapes are
+    identical in langchain-core 1.x: ImageContentBlock, AudioContentBlock and
+    VideoContentBlock all carry type/base64/mime_type/url (the video block adds an
+    optional file_id, which MediaReference has no way to populate). Document is
+    the exception - FileContentBlock requires a filename that MediaReference does
+    not carry - and will need a branch when wired up.
 
-    Two asymmetries between image and audio live below this function, in the
+    Three asymmetries between modalities live below this function, in the
     provider adapters, and cannot be fixed at the block level:
 
     - Transport: an audio ref with kind="url" is representable here, and
@@ -55,6 +63,11 @@ def media_ref_to_content_block(ref: MediaReference) -> Dict[str, Any]:
       accepts only "wav" and "mp3"). Rewriting mime_type to satisfy one provider
       would break the adapters that read it as a MIME string, so the string is
       passed through unchanged and the mismatch surfaces at the API.
+    - Video delivery: a shared shape is not shared delivery. That translator
+      raises on every video block ("Block of type video is not supported."), on
+      either API, and the Ollama message schema has no video field. A mapping
+      this generic cannot see either case, so adapter_capabilities keeps video
+      off those transports before the block is ever built.
 
     Args:
         ref (MediaRef): The resolved media reference from BaseLLMChain._media_parts.
@@ -95,14 +108,14 @@ def profile_to_capabilities(profile: Any) -> Dict[ContentType, bool]:
     return capabilities
 
 
-def _ollama_carries_audio() -> bool:
-    """Report whether the Ollama chat request schema can carry an audio part.
+def _ollama_carries(modality: ContentType) -> bool:
+    """Report whether the Ollama chat request schema can carry a modality part.
 
     This is a fact about the wire format, not about a model family: the message
-    type has one field per media kind, so if no audio field exists, no Ollama
-    model can receive audio regardless of what its model card claims. Read from
-    the installed schema rather than hardcoded, so the answer updates when the
-    transport gains one. An unreadable schema reports True, which leaves the
+    type has one field per media kind, so if no field names one, no Ollama model
+    can receive it regardless of what its model card claims. Read from the
+    installed schema rather than hardcoded, so the answer updates when the
+    transport gains a field. An unreadable schema reports True, which leaves the
     modality undecidable and keeps auto mode fail-loud.
     """
     try:
@@ -111,7 +124,38 @@ def _ollama_carries_audio() -> bool:
         fields = set(Message.model_fields)
     except Exception:  # noqa: BLE001 - optional dependency, private module path
         return True
-    return any("audio" in field.lower() for field in fields)
+    return any(modality in field.lower() for field in fields)
+
+
+def _openai_translator_carries(modality: ContentType) -> bool:
+    """Report whether langchain-core's OpenAI translator can emit a modality block.
+
+    Every langchain_openai adapter (ChatOpenAI, AzureChatOpenAI) builds its
+    request bodies with this translator, so a block type it refuses is
+    undeliverable through that transport whatever a model profile claims. The
+    probe is a well-formed base64 block of the modality, matching what
+    media_ref_to_content_block produces: a ValueError is the translator's own
+    verdict ("Block of type video is not supported."), while an ImportError or
+    any other failure means the probe itself broke, which stays undecidable and
+    keeps auto mode fail-loud. Read from the installed code rather than
+    hardcoded, so the answer updates when the translator gains a block type.
+    """
+    try:
+        from langchain_core.messages.block_translators.openai import (
+            convert_to_openai_data_block,
+        )
+
+        convert_to_openai_data_block(
+            {"type": modality, "base64": "AAAA", "mime_type": f"{modality}/mp4"},
+            api="chat/completions",
+        )
+    except ImportError:
+        return True
+    except ValueError:
+        return False
+    except Exception:  # noqa: BLE001 - a broken probe must not deny anything
+        return True
+    return True
 
 
 def adapter_capabilities(model: Any) -> Dict[ContentType, bool]:
@@ -120,7 +164,8 @@ def adapter_capabilities(model: Any) -> Dict[ContentType, bool]:
     Complements profile_to_capabilities: a model profile states what a model
     understands, this states what the request format can carry, and the second is
     a hard ceiling on the first. Only denials are returned - a transport that
-    names an audio field proves nothing about a given model accepting it.
+    names an audio field, or translates an image block, proves nothing about a
+    given model accepting that media.
 
     Args:
         model: A BaseChatModel instance.
@@ -129,10 +174,19 @@ def adapter_capabilities(model: Any) -> Dict[ContentType, bool]:
         Dict[ContentType, bool]: Modalities the transport cannot deliver, as False.
     """
     for klass in type(model).__mro__:
-        if klass.__module__.split(".")[0] == "langchain_ollama":
-            if not _ollama_carries_audio():
-                return {"audio": False}
-            return {}
+        root = klass.__module__.split(".")[0]
+        if root == "langchain_ollama":
+            return {
+                modality: False
+                for modality in _CEILING_MODALITIES
+                if not _ollama_carries(modality)
+            }
+        if root == "langchain_openai":
+            return {
+                modality: False
+                for modality in _CEILING_MODALITIES
+                if not _openai_translator_carries(modality)
+            }
     return {}
 
 
