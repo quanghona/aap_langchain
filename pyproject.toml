@@ -34,6 +34,8 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "langchain-ollama>=1.0.0",
+    "langchain-openai>=1.7.0",
+    "langchain-google-genai>=4.0.0",
     "ipykernel",
     "langchain-weaviate>=0.0.6",
     "faiss-cpu>=1.13.2",
@@ -50,3 +52,10 @@ weaviate = [
 hf = [
     "huggingface-hub>=0.23.0"
 ]
+google = [
+    "langchain-google-genai>=4.0.0"
+]
+openai = [
+    "langchain-openai>=1.7.0"
+]
+

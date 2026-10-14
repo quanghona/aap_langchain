@@ -6,24 +6,29 @@ Hugging Face lookup is stubbed by an autouse fixture so detection is
 deterministic offline.
 """
 
+import ast
 import base64
+import inspect
 import logging
+import re
+import textwrap
 from typing import Any, Dict, List, Optional
 
 import pytest
 from aap_core.types import AgentMessage, ContentType
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import BaseMessage
-from pydantic import Field
-
-import aap_langchain.chain as chain_module
 from aap_core.utils import (
     extract_repo_id,
     huggingface_capabilities,
     task_tags_to_capabilities,
 )
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from pydantic import Field
+
+import aap_langchain.chain as chain_module
 from aap_langchain.chain import ChatCausalMultiTurnsChain
 from aap_langchain.utils import (
+    _module_carries_blocks,
     _ollama_carries,
     _openai_translator_carries,
     adapter_capabilities,
@@ -1057,3 +1062,253 @@ class TestOpenAIBlockContract:
         block = user_message_of(chain._prepare_conversation(msg)).content[1]
         with pytest.raises(ValueError, match="not supported"):
             self._translate(block)
+
+
+class TestGeminiVideoContract:
+    """Our blocks checked against the converter langchain_google_genai sends them to.
+
+    Gemini needs no ceiling and no mapping branch: its adapter routes every
+    data content block (is_data_content_block covers image, video and audio)
+    through its own part converter, which reads the same base64/mime_type/url
+    fields media_ref_to_content_block produces. These tests pin that agreement
+    so a block-shape change on either side fails here, not at the API.
+    """
+
+    @staticmethod
+    def _gemini_model():
+        langchain_google_genai = pytest.importorskip("langchain_google_genai")
+        return langchain_google_genai.ChatGoogleGenerativeAI(
+            model="gemini-2.5-pro", google_api_key="offline-test"
+        )
+
+    def test_gemini_gets_no_ceiling_opinion(self):
+        """The transport carries video; adapter_capabilities must stay silent."""
+        assert adapter_capabilities(self._gemini_model()) == {}
+
+    def test_our_video_block_is_a_data_content_block(self):
+        """The dispatch key Gemini's converter branches on, both ref kinds."""
+        from langchain_core.messages.content import is_data_content_block
+
+        assert is_data_content_block({"type": "video", "url": "https://x/a.mp4"})
+        assert is_data_content_block(
+            {"type": "video", "base64": "AAAA", "mime_type": "video/mp4"}
+        )
+
+    def test_funnel_output_reaches_gemini_inline_part(self, tmp_path):
+        """End to end offline: local file -> funnel -> Gemini Part, byte-exact."""
+        from langchain_google_genai.chat_models import _convert_to_parts
+
+        f = tmp_path / "clip.mp4"
+        f.write_bytes(MP4_MAGIC + b"\x00" * 16)
+        chain = ChatCausalMultiTurnsChain(
+            model=self._gemini_model(),
+            system_prompt="You are helpful.",
+            user_prompt_template="{query}",
+        )
+        msg = AgentMessage(query="watch", query_media=[("video", str(f))])
+        blocks = user_message_of(chain._prepare_conversation(msg)).content
+        parts = _convert_to_parts(blocks)
+        assert parts[0].text == "watch"
+        assert parts[1].inline_data.mime_type == "video/mp4"
+        assert parts[1].inline_data.data == f.read_bytes()
+
+
+class TestRealOpenAIDispatch:
+    """The langchain_openai ceiling against the real adapter, now installed.
+
+    The FakeOpenAIChatModel stand-in pins the dispatch mechanism; these pin the
+    production path, including the finding that a custom base_url does not
+    rescue video: the adapter translates every data block before the request
+    reaches any endpoint, so a DashScope-compatible ChatOpenAI fails in the
+    adapter exactly like api.openai.com does.
+    """
+
+    @staticmethod
+    def _openai_model(**kwargs):
+        langchain_openai = pytest.importorskip("langchain_openai")
+        return langchain_openai.ChatOpenAI(api_key="offline-test", **kwargs)
+
+    def test_real_chatopenai_denies_video(self):
+        assert adapter_capabilities(self._openai_model(model="gpt-4o")) == {
+            "video": False
+        }
+
+    def test_custom_base_url_still_denies_video(self):
+        """Canary for the rejected base_url refinement: compat endpoints crash too."""
+        model = self._openai_model(
+            model="qwen-vl-max",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        assert adapter_capabilities(model) == {"video": False}
+
+    def test_real_chatopenai_video_degrades_to_text(self, caplog):
+        chain = ChatCausalMultiTurnsChain(
+            model=self._openai_model(model="gpt-4o"),
+            system_prompt="You are helpful.",
+            user_prompt_template="{query}",
+        )
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "watch"
+        assert "does not support video input" in caplog.text
+
+    def test_real_chatopenai_keeps_image_and_audio_undenied(self):
+        """The probe must deny only what the translator refuses."""
+        capabilities = adapter_capabilities(self._openai_model(model="gpt-4o"))
+        assert "image" not in capabilities
+        assert "audio" not in capabilities
+
+
+class FakeHuggingFaceChatModel(FakeChatModel):
+    """Stand-in for the langchain_huggingface root; its converter passes content raw.
+
+    The probe reads the module the class claims, so pointing __module__ at the
+    installed huggingface.py exercises the production path without a model
+    download. The module must be imported first: inspect resolves a class's
+    module through sys.modules.
+    """
+
+
+FakeHuggingFaceChatModel.__module__ = "langchain_huggingface.chat_models.huggingface"
+
+
+class FakeTongyiChatModel(FakeChatModel):
+    """Stand-in for the langchain_community root (ChatTongyi), same raw path."""
+
+
+FakeTongyiChatModel.__module__ = "langchain_community.chat_models.tongyi"
+
+
+class TestRawContentTransportCeiling:
+    """Adapters that serialize message.content verbatim cannot carry media parts.
+
+    Verified in the installed sources: neither langchain_huggingface's
+    _convert_message_to_dict nor ChatTongyi's conversion names a block
+    translator or a media part shape, so a content-block list reaches the wire
+    unchanged and dies at the API whatever the model behind it understands.
+    They get a deny-all ceiling like any other transport with no field for the
+    modality - and the same escape hatch: an explicit media_support declaration
+    bypasses detection, so the adapter's own error surfaces.
+    """
+
+    @staticmethod
+    def _chain(model: Any, **kwargs) -> ChatCausalMultiTurnsChain:
+        return ChatCausalMultiTurnsChain(
+            model=model,
+            system_prompt="You are helpful.",
+            user_prompt_template="{query}",
+            **kwargs,
+        )
+
+    def test_huggingface_root_denies_every_media_modality(self):
+        pytest.importorskip("langchain_huggingface")
+        import langchain_huggingface.chat_models.huggingface  # noqa: F401
+
+        assert adapter_capabilities(FakeHuggingFaceChatModel()) == {
+            "image": False,
+            "audio": False,
+            "video": False,
+        }
+
+    def test_tongyi_root_denies_every_media_modality(self):
+        import langchain_community.chat_models.tongyi  # noqa: F401
+
+        assert adapter_capabilities(FakeTongyiChatModel()) == {
+            "image": False,
+            "audio": False,
+            "video": False,
+        }
+
+    def test_raw_content_video_degrades_to_text(self, caplog):
+        pytest.importorskip("langchain_huggingface")
+        import langchain_huggingface.chat_models.huggingface  # noqa: F401
+
+        chain = self._chain(FakeHuggingFaceChatModel())
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        with caplog.at_level(logging.WARNING, logger="aap_core.types"):
+            content = user_message_of(chain._prepare_conversation(msg)).content
+        assert content == "watch"
+        assert "does not support video input" in caplog.text
+
+    def test_enabled_policy_overrides_the_raw_content_denial(self):
+        pytest.importorskip("langchain_huggingface")
+        import langchain_huggingface.chat_models.huggingface  # noqa: F401
+
+        chain = self._chain(
+            FakeHuggingFaceChatModel(), media_support={"video": "enabled"}
+        )
+        msg = AgentMessage(
+            query="watch", query_media=[("video", "https://example.com/a.mp4")]
+        )
+        content = user_message_of(chain._prepare_conversation(msg)).content
+        assert isinstance(content, list) and content[1]["type"] == "video"
+
+    def test_marker_probe_agrees_with_the_installed_sources(self):
+        """Canary: if either module gains block handling, the deny-all must lift."""
+        import langchain_community.chat_models.tongyi  # noqa: F401
+        import langchain_huggingface.chat_models.huggingface  # noqa: F401
+
+        assert _module_carries_blocks(FakeHuggingFaceChatModel()) is False
+        assert _module_carries_blocks(FakeTongyiChatModel()) is False
+
+    def test_community_adapter_that_names_media_parts_is_not_denied(self):
+        """The probe reads the module, not the root: a community adapter whose
+        code does name media part shapes stays undecidable, not blanket-denied."""
+        import langchain_community.chat_models.ollama  # noqa: F401
+
+        class FakeCommunityOllama(FakeChatModel):
+            pass
+
+        FakeCommunityOllama.__module__ = "langchain_community.chat_models.ollama"
+        assert _module_carries_blocks(FakeCommunityOllama()) is True
+        assert adapter_capabilities(FakeCommunityOllama()) == {}
+
+    def test_unreadable_module_stays_undecidable(self):
+        """A class whose module cannot be resolved reports carried: fail loud."""
+
+        class FakeFrozenChatModel(FakeChatModel):
+            pass
+
+        FakeFrozenChatModel.__module__ = "not_a_real_package.chat_models"
+        assert _module_carries_blocks(FakeFrozenChatModel()) is True
+        assert adapter_capabilities(FakeFrozenChatModel()) == {}
+
+
+class TestMappingIsProviderAgnostic:
+    """The bridge invariant: media mapping is a function of the reference alone.
+
+    Provider knowledge belongs in profile_to_capabilities and
+    adapter_capabilities, never in the mapper. The frameworks ship hundreds of
+    provider packages; a mapper that branches on model identity re-scatters
+    per-provider special cases across the integration and cannot scale. These
+    tests pin the structure so a future session cannot regress it silently.
+    """
+
+    @staticmethod
+    def _body_source(fn) -> str:
+        """The function body as code, docstring removed: prose may name providers."""
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        definition = tree.body[0]
+        definition.body = [
+            statement
+            for statement in definition.body
+            if not (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            )
+        ]
+        return ast.unparse(definition)
+
+    def test_mapper_takes_only_the_reference(self):
+        """No model parameter means no way to branch on model identity."""
+        assert list(inspect.signature(media_ref_to_content_block).parameters) == ["ref"]
+
+    def test_mapper_body_names_no_provider_surface(self):
+        body = self._body_source(media_ref_to_content_block)
+        assert not re.search(r"\bmodel\b|\bprofile\b|__module__|adapter", body)
