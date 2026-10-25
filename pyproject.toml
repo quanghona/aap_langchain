@@ -1,6 +1,6 @@
 [project]
 name = "aap_langchain"
-version = "0.2.0"
+version = "0.3.0.dev1"
 description = "Langchain integration of agent design pattern"
 readme = "README.md"
 authors = [
@@ -10,7 +10,7 @@ license = { text = "MIT" }
 keywords = ["agent", "ai", "pattern", "llm", "langchain"]
 requires-python = ">=3.10.12"
 dependencies = [
-    "aap_core>=0.1.0",
+    "aap_core>=0.3.2",
     "langchain-core>=1.1.0",
 ]
 classifiers = [
