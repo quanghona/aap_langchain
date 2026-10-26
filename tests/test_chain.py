@@ -8,9 +8,11 @@ deterministic offline.
 
 import ast
 import base64
+import importlib.util
 import inspect
 import logging
 import re
+import sys
 import textwrap
 from typing import Any, Dict, List, Optional
 
@@ -1256,17 +1258,33 @@ class TestRawContentTransportCeiling:
         assert _module_carries_blocks(FakeHuggingFaceChatModel()) is False
         assert _module_carries_blocks(FakeTongyiChatModel()) is False
 
-    def test_community_adapter_that_names_media_parts_is_not_denied(self):
+    def test_community_adapter_that_names_media_parts_is_not_denied(
+        self, tmp_path, monkeypatch
+    ):
         """The probe reads the module, not the root: a community adapter whose
-        code does name media part shapes stays undecidable, not blanket-denied."""
-        import langchain_community.chat_models.ollama  # noqa: F401
+        code does name media part shapes stays undecidable, not blanket-denied.
 
-        class FakeCommunityOllama(FakeChatModel):
+        Synthetic module, not a real provider file: langchain-community is
+        sunsetting and deletes integrations between patch releases
+        (chat_models.ollama shipped in 0.4.1, gone in 0.4.2), so pointing this
+        test at any community file couples our suite to a layout we do not
+        control. The probe only needs a sys.modules entry under the
+        langchain_community root whose source names a media part shape.
+        """
+        name = "langchain_community.chat_models._media_naming_probe"
+        path = tmp_path / "_media_naming_probe.py"
+        path.write_text("CONVERTS = ['image_url', 'input_audio']\n")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+
+        class FakeCommunityAdapter(FakeChatModel):
             pass
 
-        FakeCommunityOllama.__module__ = "langchain_community.chat_models.ollama"
-        assert _module_carries_blocks(FakeCommunityOllama()) is True
-        assert adapter_capabilities(FakeCommunityOllama()) == {}
+        FakeCommunityAdapter.__module__ = name
+        assert _module_carries_blocks(FakeCommunityAdapter()) is True
+        assert adapter_capabilities(FakeCommunityAdapter()) == {}
 
     def test_unreadable_module_stays_undecidable(self):
         """A class whose module cannot be resolved reports carried: fail loud."""
